@@ -1,16 +1,15 @@
 mod address;
 mod error;
-mod gui;
-mod network;
-mod transaction;
-mod wallet;
+mod rpc;
 
 use crate::error::WalletError;
-use crate::wallet::KaspaWallet;
+use crate::rpc::RpcClient;
 use clap::{Parser, Subcommand};
-use secp256k1::SecretKey;
+use secp256k1::{PublicKey, Secp256k1, SecretKey};
 use std::fs;
 use std::io::{self, Write};
+
+const DEFAULT_RPC_URL: &str = "https://api-tn10.kaspa.org";
 
 #[derive(Parser)]
 #[command(name = "kasparustwallet")]
@@ -24,7 +23,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     Create {
-        #[arg(short, long, default_value = "mainnet")]
+        #[arg(short, long, default_value = "testnet-10")]
         network: String,
         #[arg(short, long)]
         output: Option<String>,
@@ -32,52 +31,38 @@ enum Commands {
     Info {
         #[arg(short, long)]
         private_key: String,
-        #[arg(short, long, default_value = "mainnet")]
+        #[arg(short, long, default_value = "testnet-10")]
         network: String,
     },
     Address {
         #[arg(short, long)]
         private_key: String,
-        #[arg(short, long, default_value = "mainnet")]
+        #[arg(short, long, default_value = "testnet-10")]
         network: String,
     },
-    Send {
+    Balance {
         #[arg(short, long)]
-        private_key: String,
-        #[arg(short, long, default_value = "mainnet")]
-        network: String,
-        #[arg(short, long)]
-        inputs: Vec<String>,
-        #[arg(short, long)]
-        outputs: Vec<String>,
-        #[arg(short, long, default_value = "1000")]
-        fee_rate: u64,
-    },
-    EstimateFee {
-        #[arg(short, long)]
-        inputs: usize,
-        #[arg(short, long)]
-        outputs: usize,
-        #[arg(short, long, default_value = "1000")]
-        fee_rate: u64,
+        address: String,
+        #[arg(long)]
+        rpc: Option<String>,
     },
     ValidateAddress {
         #[arg(short, long)]
         address: String,
     },
-    Gui,
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let cli = Cli::parse();
 
-    if let Err(e) = run_cli(cli) {
+    if let Err(e) = run_cli(cli).await {
         eprintln!("Error: {}", e);
         std::process::exit(1);
     }
 }
 
-fn run_cli(cli: Cli) -> Result<(), WalletError> {
+async fn run_cli(cli: Cli) -> Result<(), WalletError> {
     match cli.command {
         Commands::Create { network, output } => create_new_wallet(&network, output),
         Commands::Info {
@@ -88,38 +73,33 @@ fn run_cli(cli: Cli) -> Result<(), WalletError> {
             private_key,
             network,
         } => generate_address(&private_key, &network),
-        Commands::Send {
-            private_key,
-            network,
-            inputs,
-            outputs,
-            fee_rate,
-        } => create_transaction(&private_key, &network, inputs, outputs, fee_rate),
-        Commands::EstimateFee {
-            inputs,
-            outputs,
-            fee_rate,
-        } => estimate_fee(inputs, outputs, fee_rate),
+        Commands::Balance { address, rpc } => get_balance(&address, rpc.as_deref()).await,
         Commands::ValidateAddress { address } => validate_address(&address),
-        Commands::Gui => gui::run_gui().map_err(|e| WalletError::Network(e.to_string())),
     }
 }
 
 fn create_new_wallet(network: &str, output: Option<String>) -> Result<(), WalletError> {
-    let secp = secp256k1::Secp256k1::new();
-    let (secret_key, _public_key) = secp.generate_keypair(&mut rand::rngs::OsRng);
+    let mut rng = rand::rngs::OsRng;
+    let mut secret_bytes = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rng, &mut secret_bytes);
+    let secret_key = SecretKey::from_slice(&secret_bytes).expect("Failed to create secret key");
+    let secp = Secp256k1::new();
+    let public_key = PublicKey::from_secret_key(&secp, &secret_key);
 
-    let wallet = KaspaWallet::with_network(secret_key, network)?;
+    let address = address::generate_address(&public_key, network)?;
+
+    let private_key_hex = hex::encode(secret_key.secret_bytes());
+    let public_key_hex = hex::encode(public_key.serialize());
 
     let wallet_info = format!(
         "Network: {}\n\
          Private Key: {}\n\
          Public Key: {}\n\
          Address: {}\n",
-        wallet.get_network_name(),
-        wallet.get_private_key(),
-        wallet.get_public_key(),
-        wallet.get_address()
+        network,
+        private_key_hex,
+        public_key_hex,
+        address
     );
 
     if let Some(output_path) = output {
@@ -142,14 +122,17 @@ fn show_wallet_info(private_key: &str, network: &str) -> Result<(), WalletError>
     let secret_key_bytes = hex::decode(private_key)?;
     let secret_key = SecretKey::from_slice(&secret_key_bytes)?;
 
-    let wallet = KaspaWallet::with_network(secret_key, network)?;
+    let secp = Secp256k1::new();
+    let public_key = PublicKey::from_secret_key(&secp, &secret_key);
+
+    let address = address::generate_address(&public_key, network)?;
 
     println!("Wallet Information:");
     println!("==================");
-    println!("Network: {}", wallet.get_network_name());
-    println!("Private Key: {}", wallet.get_private_key());
-    println!("Public Key: {}", wallet.get_public_key());
-    println!("Address: {}", wallet.get_address());
+    println!("Network: {}", network);
+    println!("Private Key: {}", private_key);
+    println!("Public Key: {}", hex::encode(public_key.serialize()));
+    println!("Address: {}", address);
 
     Ok(())
 }
@@ -158,100 +141,33 @@ fn generate_address(private_key: &str, network: &str) -> Result<(), WalletError>
     let secret_key_bytes = hex::decode(private_key)?;
     let secret_key = SecretKey::from_slice(&secret_key_bytes)?;
 
-    let wallet = KaspaWallet::with_network(secret_key, network)?;
+    let secp = Secp256k1::new();
+    let public_key = PublicKey::from_secret_key(&secp, &secret_key);
+
+    let address = address::generate_address(&public_key, network)?;
 
     println!("Generated Address:");
     println!("==================");
-    println!("{}", wallet.get_address());
+    println!("{}", address);
 
     Ok(())
 }
 
-fn create_transaction(
-    private_key: &str,
-    network: &str,
-    inputs: Vec<String>,
-    outputs: Vec<String>,
-    fee_rate: u64,
-) -> Result<(), WalletError> {
-    let secret_key_bytes = hex::decode(private_key)?;
-    let secret_key = SecretKey::from_slice(&secret_key_bytes)?;
+async fn get_balance(address: &str, rpc_url: Option<&str>) -> Result<(), WalletError> {
+    let rpc = rpc_url.unwrap_or(DEFAULT_RPC_URL);
+    let client = RpcClient::new(Some(rpc));
 
-    let wallet = KaspaWallet::with_network(secret_key, network)?;
-
-    let parsed_inputs: Result<Vec<(String, u32)>, WalletError> = inputs
-        .iter()
-        .map(|input| {
-            let parts: Vec<&str> = input.split(':').collect();
-            if parts.len() != 2 {
-                return Err(WalletError::InvalidParameters(format!(
-                    "Invalid input format: {}",
-                    input
-                )));
-            }
-            Ok((
-                parts[0].to_string(),
-                parts[1].parse().map_err(|_| {
-                    WalletError::InvalidParameters(format!("Invalid vout in: {}", input))
-                })?,
-            ))
-        })
-        .collect();
-
-    let parsed_outputs: Result<Vec<(String, u64)>, WalletError> = outputs
-        .iter()
-        .map(|output| {
-            let parts: Vec<&str> = output.split(':').collect();
-            if parts.len() != 2 {
-                return Err(WalletError::InvalidParameters(format!(
-                    "Invalid output format: {}",
-                    output
-                )));
-            }
-            Ok((
-                parts[0].to_string(),
-                parts[1].parse().map_err(|_| {
-                    WalletError::InvalidParameters(format!("Invalid amount in: {}", output))
-                })?,
-            ))
-        })
-        .collect();
-
-    let transaction = wallet.create_transaction(parsed_inputs?, parsed_outputs?, fee_rate)?;
-
-    println!("Transaction Created:");
-    println!("==================");
-    println!("Version: {}", transaction.version);
-    println!("Inputs:");
-    for (i, input) in transaction.inputs.iter().enumerate() {
-        println!(
-            "  {}: {}:{} (signed: {})",
-            i,
-            input.txid,
-            input.vout,
-            input.signature.is_some()
-        );
+    match client.get_balance_by_address(address).await {
+        Ok(response) => {
+            println!("Balance for {}:", address);
+            println!("==================");
+            println!("Balance: {} sompi", response.balance);
+            println!("KAS: {:.8}", response.balance as f64 / 100_000_000.0);
+        }
+        Err(e) => {
+            return Err(WalletError::Network(format!("Failed to get balance: {}", e)));
+        }
     }
-    println!("Outputs:");
-    for (i, output) in transaction.outputs.iter().enumerate() {
-        println!("  {}: {} ({} sompi)", i, output.address, output.amount);
-    }
-
-    let serialized = transaction.serialize()?;
-    println!("Serialized: {}", hex::encode(&serialized));
-
-    Ok(())
-}
-
-fn estimate_fee(inputs: usize, outputs: usize, fee_rate: u64) -> Result<(), WalletError> {
-    let fee = KaspaWallet::estimate_transaction_fee(inputs, outputs, fee_rate);
-
-    println!("Estimated Fee:");
-    println!("==============");
-    println!("Inputs: {}", inputs);
-    println!("Outputs: {}", outputs);
-    println!("Fee Rate: {} sompkB", fee_rate);
-    println!("Total Fee: {} sompi", fee);
 
     Ok(())
 }
